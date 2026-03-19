@@ -1,0 +1,50 @@
+{
+  "feature_names": [
+    "file_type",
+    "file_size",
+    "entropy",
+    "num_sections",
+    "virtual_size",
+    "raw_size",
+    "num_imports",
+    "num_exports",
+    "has_debug",
+    "has_tls",
+    "has_resources",
+    "is_packed",
+    "suspicious_section_name",
+    "unusual_entry_point",
+    "high_entropy_code",
+    "imports_crypto",
+    "imports_network",
+    "imports_registry",
+    "pe_header_size",
+    "timestamp_valid",
+    "dll_characteristics"
+  ],
+  "accuracy": 1.0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1_score": 1.0,
+  "threshold": 0.45,
+  "n_estimators": 300,
+  "model_type": "RandomForestClassifier",
+  "file_types": [
+    "non-PE(0)",
+    "PE-executable(1)"
+  ],
+  "zones": {
+    "safe": [
+      0.0,
+      0.45
+    ],
+    "suspicious": [
+      0.45,
+      0.65
+    ],
+    "malware": [
+      0.65,
+      1.0
+    ]
+  }
+}
