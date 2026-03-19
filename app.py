@@ -32,9 +32,24 @@ for d in [QUARANTINE_DIR, UPLOAD_DIR]:
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "bankshield_pro_rbi_2024_xK9!mQ")
 
+# ── Session cookie config — REQUIRED for cross-domain (Netlify ↔ Render) ──────
+app.config.update(
+    SESSION_COOKIE_SECURE=True,        # HTTPS only
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="None",    # Allow cross-site cookies (Netlify → Render)
+    SESSION_COOKIE_NAME="bankshield_session",
+    PERMANENT_SESSION_LIFETIME=86400,  # 24 hours
+)
+
 # CORS — allow your frontend URL (set FRONTEND_URL env var on Render)
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "*")
-CORS(app, supports_credentials=True, origins=FRONTEND_URL)
+CORS(app,
+     supports_credentials=True,
+     origins=FRONTEND_URL,
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "DELETE", "OPTIONS"],
+     expose_headers=["Set-Cookie"]
+)
 
 # ── Load ML model ──────────────────────────────────────────────────────────────
 with open(MODEL_PATH, "rb") as f:
@@ -335,6 +350,7 @@ def login():
     conn.close()
     if not user:
         return jsonify({"error": "Invalid credentials"}), 401
+    session.permanent  = True   # Keep session alive (24hrs)
     session["user_id"]  = user["id"]
     session["username"] = user["username"]
     session["role"]     = user["role"]
