@@ -82,114 +82,63 @@ NON_PE_EXTENSIONS = {
 }
 
 # ── Turso HTTP API helper ──────────────────────────────────────────────────────
-import urllib.request as _urllib
 import json as _json
+import requests as _req_lib
 
-def turso_execute(sql, params=None):
-    """Execute SQL on Turso via HTTP API. Returns rows as list of dicts."""
-    # Build the request body
-    if params:
-        # Convert params to Turso format
-        turso_args = []
-        for p in params:
-            if p is None:
-                turso_args.append({"type": "null"})
-            elif isinstance(p, int):
-                turso_args.append({"type": "integer", "value": str(p)})
-            elif isinstance(p, float):
-                turso_args.append({"type": "float", "value": str(p)})
-            else:
-                turso_args.append({"type": "text", "value": str(p)})
-        body = _json.dumps({
-            "requests": [
-                {"type": "execute", "stmt": {"sql": sql, "args": turso_args}},
-                {"type": "close"}
-            ]
-        })
-    else:
-        body = _json.dumps({
-            "requests": [
-                {"type": "execute", "stmt": {"sql": sql}},
-                {"type": "close"}
-            ]
-        })
+def _to_arg(p):
+    if p is None:               return {"type": "null"}
+    if isinstance(p, bool):     return {"type": "integer", "value": "1" if p else "0"}
+    if isinstance(p, int):      return {"type": "integer", "value": str(p)}
+    if isinstance(p, float):    return {"type": "float",   "value": str(p)}
+    return                             {"type": "text",    "value": str(p)}
 
-    # Build URL — convert libsql:// to https://
-    http_url = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+def _turso_call(stmts):
+    """stmts = list of (sql, params_list_or_None)"""
+    url     = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+    headers = {"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"}
+    reqs    = []
+    for sql, params in stmts:
+        item = {"type": "execute", "stmt": {"sql": sql}}
+        if params:
+            item["stmt"]["args"] = [_to_arg(p) for p in params]
+        reqs.append(item)
+    reqs.append({"type": "close"})
+    r = _req_lib.post(url, json={"requests": reqs}, headers=headers, timeout=20)
+    if not r.ok:
+        raise Exception(f"Turso {r.status_code}: {r.text[:300]}")
+    return r.json()
 
-    req = _urllib.Request(
-        http_url,
-        data=body.encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {TURSO_TOKEN}",
-            "Content-Type": "application/json"
-        },
-        method="POST"
-    )
-    with _urllib.urlopen(req) as resp:
-        result = _json.loads(resp.read().decode("utf-8"))
-
-    # Parse result into list of dicts
-    rows_data = result["results"][0]
-    if rows_data.get("type") == "error":
-        err_msg = rows_data.get("error", {})
-        if isinstance(err_msg, dict):
-            err_msg = err_msg.get("message", str(err_msg))
-        raise Exception(f"Turso error: {err_msg}")
-
-    response = rows_data.get("response", {})
-    result_inner = response.get("result", {})
-    cols = [c["name"] for c in result_inner.get("cols", [])]
-    rows = []
-    for row in result_inner.get("rows", []):
+def _parse(data, idx=0):
+    res = data["results"][idx]
+    if res.get("type") == "error":
+        raise Exception(f"Turso SQL error: {res.get('error')}")
+    inner = res.get("response", {}).get("result", {})
+    cols  = [c["name"] for c in inner.get("cols", [])]
+    rows  = []
+    for row in inner.get("rows", []):
         d = {}
         for i, col in enumerate(cols):
-            val = row[i]
-            if isinstance(val, dict):
-                t = val.get("type", "")
-                v = val.get("value")
-                if t == "null" or v is None:
-                    d[col] = None
-                elif t == "integer":
-                    d[col] = int(v)
-                elif t == "float":
-                    d[col] = float(v)
-                else:
-                    d[col] = v
+            v = row[i]
+            if isinstance(v, dict):
+                t, val = v.get("type",""), v.get("value")
+                if t == "null" or val is None: d[col] = None
+                elif t == "integer":           d[col] = int(val)
+                elif t == "float":             d[col] = float(val)
+                else:                          d[col] = val
             else:
-                d[col] = val
+                d[col] = v
         rows.append(d)
+    rowid = inner.get("last_insert_rowid")
+    return rows, (int(rowid) if rowid else None)
 
-    # last_insert_rowid can be in different places depending on Turso version
-    last_id = (
-        result_inner.get("last_insert_rowid") or
-        response.get("last_insert_rowid") or
-        rows_data.get("last_insert_rowid")
-    )
-    affected = result_inner.get("affected_row_count", 0)
-    return rows, last_id, affected
+def turso_execute(sql, params=None):
+    data = _turso_call([(sql, params)])
+    rows, rowid = _parse(data, 0)
+    return rows, rowid, 0
 
 def turso_executescript(sql_script):
-    """Execute multiple SQL statements on Turso."""
-    statements = [s.strip() for s in sql_script.strip().split(";") if s.strip()]
-    requests = []
-    for stmt in statements:
-        requests.append({"type": "execute", "stmt": {"sql": stmt}})
-    requests.append({"type": "close"})
-
-    http_url = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
-    body = _json.dumps({"requests": requests})
-    req = _urllib.Request(
-        http_url,
-        data=body.encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {TURSO_TOKEN}",
-            "Content-Type": "application/json"
-        },
-        method="POST"
-    )
-    with _urllib.urlopen(req) as resp:
-        return _json.loads(resp.read().decode("utf-8"))
+    stmts = [(s.strip(), None) for s in sql_script.strip().split(";") if s.strip()]
+    _turso_call(stmts)
 
 # ── TursoConn: sqlite3-compatible wrapper ──────────────────────────────────────
 class TursoConn:
