@@ -131,8 +131,11 @@ def turso_execute(sql, params=None):
 
     # Parse result into list of dicts
     rows_data = result["results"][0]
-    if rows_data["type"] == "error":
-        raise Exception(f"Turso error: {rows_data['error']}")
+    if rows_data.get("type") == "error":
+        err_msg = rows_data.get("error", {})
+        if isinstance(err_msg, dict):
+            err_msg = err_msg.get("message", str(err_msg))
+        raise Exception(f"Turso error: {err_msg}")
 
     response = rows_data.get("response", {})
     result_inner = response.get("result", {})
@@ -156,7 +159,15 @@ def turso_execute(sql, params=None):
             else:
                 d[col] = val
         rows.append(d)
-    return rows, result_inner.get("last_insert_rowid"), result_inner.get("affected_row_count", 0)
+
+    # last_insert_rowid can be in different places depending on Turso version
+    last_id = (
+        result_inner.get("last_insert_rowid") or
+        response.get("last_insert_rowid") or
+        rows_data.get("last_insert_rowid")
+    )
+    affected = result_inner.get("affected_row_count", 0)
+    return rows, last_id, affected
 
 def turso_executescript(sql_script):
     """Execute multiple SQL statements on Turso."""
@@ -973,6 +984,25 @@ def model_info():
         "dataset":      "Synthetic Banking Threat Dataset",
         "classes":      ["Clean Document (0)", "Banking Threat (1)"]
     })
+
+# ── Global error handler — returns JSON instead of HTML for 500 errors ──────
+@app.errorhandler(500)
+def internal_error(e):
+    import traceback
+    return jsonify({
+        "error": "Internal server error",
+        "details": str(e),
+        "trace": traceback.format_exc()
+    }), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    print(f"[UNHANDLED ERROR] {e}\n{traceback.format_exc()}")
+    return jsonify({
+        "error": str(e),
+        "type": type(e).__name__
+    }), 500
 
 # ── Health check (Render uses this to verify the service is up) ────────────────
 @app.route("/", methods=["GET"])
