@@ -13,20 +13,30 @@ from flask_cors import CORS
 import sqlite3
 import numpy as np
 
-# ── Paths (Render-compatible: use /tmp for writable dirs) ─────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 ML_DIR         = os.path.join(BASE_DIR, "ml_model")
 MODEL_PATH     = os.path.join(ML_DIR, "random_forest_model.pkl")
 SCALER_PATH    = os.path.join(ML_DIR, "scaler.pkl")
 META_PATH      = os.path.join(ML_DIR, "model_metadata.json")
 
-# On Render, filesystem outside /tmp is read-only — use /tmp for writable dirs
 QUARANTINE_DIR = "/tmp/bankshield_quarantine"
 UPLOAD_DIR     = "/tmp/bankshield_uploads"
-DB_PATH        = "/tmp/bankshield.db"
 
 for d in [QUARANTINE_DIR, UPLOAD_DIR]:
     os.makedirs(d, exist_ok=True)
+
+# ── Turso SQLite Cloud Config ──────────────────────────────────────────────────
+TURSO_URL   = os.environ.get("TURSO_DATABASE_URL", "")
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
+USE_TURSO   = bool(TURSO_URL and TURSO_TOKEN)
+
+if USE_TURSO:
+    import libsql_experimental as libsql
+    print(f"[DB] Using Turso SQLite Cloud: {TURSO_URL}")
+else:
+    DB_PATH = "/tmp/bankshield.db"
+    print("[DB] Using local SQLite (data will reset on redeploy)")
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -73,8 +83,15 @@ NON_PE_EXTENSIONS = {
 
 # ── Database ───────────────────────────────────────────────────────────────────
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if USE_TURSO:
+        conn = libsql.connect(
+            database=TURSO_URL,
+            auth_token=TURSO_TOKEN
+        )
+        conn.row_factory = libsql.Row
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
