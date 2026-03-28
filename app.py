@@ -26,14 +26,14 @@ UPLOAD_DIR     = "/tmp/bankshield_uploads"
 for d in [QUARANTINE_DIR, UPLOAD_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# ── Turso SQLite Cloud Config ──────────────────────────────────────────────────
+# ── Turso SQLite Cloud Config (HTTP API — no extra library needed) ────────────
 TURSO_URL   = os.environ.get("TURSO_DATABASE_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 USE_TURSO   = bool(TURSO_URL and TURSO_TOKEN)
 
 if USE_TURSO:
-    import libsql_experimental as libsql
-    print(f"[DB] Using Turso SQLite Cloud: {TURSO_URL}")
+    import urllib.request
+    print(f"[DB] Using Turso HTTP API: {TURSO_URL}")
 else:
     DB_PATH = "/tmp/bankshield.db"
     print("[DB] Using local SQLite (data will reset on redeploy)")
@@ -81,31 +81,190 @@ NON_PE_EXTENSIONS = {
     '.sh','.bat','.ps1',
 }
 
+# ── Turso HTTP API helper ──────────────────────────────────────────────────────
+import urllib.request as _urllib
+import json as _json
+
+def turso_execute(sql, params=None):
+    """Execute SQL on Turso via HTTP API. Returns rows as list of dicts."""
+    # Build the request body
+    if params:
+        # Convert params to Turso format
+        turso_args = []
+        for p in params:
+            if p is None:
+                turso_args.append({"type": "null"})
+            elif isinstance(p, int):
+                turso_args.append({"type": "integer", "value": str(p)})
+            elif isinstance(p, float):
+                turso_args.append({"type": "float", "value": str(p)})
+            else:
+                turso_args.append({"type": "text", "value": str(p)})
+        body = _json.dumps({
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql, "args": turso_args}},
+                {"type": "close"}
+            ]
+        })
+    else:
+        body = _json.dumps({
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql}},
+                {"type": "close"}
+            ]
+        })
+
+    # Build URL — convert libsql:// to https://
+    http_url = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+
+    req = _urllib.Request(
+        http_url,
+        data=body.encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {TURSO_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with _urllib.urlopen(req) as resp:
+        result = _json.loads(resp.read().decode("utf-8"))
+
+    # Parse result into list of dicts
+    rows_data = result["results"][0]
+    if rows_data["type"] == "error":
+        raise Exception(f"Turso error: {rows_data['error']}")
+
+    response = rows_data.get("response", {})
+    result_inner = response.get("result", {})
+    cols = [c["name"] for c in result_inner.get("cols", [])]
+    rows = []
+    for row in result_inner.get("rows", []):
+        d = {}
+        for i, col in enumerate(cols):
+            val = row[i]
+            if isinstance(val, dict):
+                t = val.get("type", "")
+                v = val.get("value")
+                if t == "null" or v is None:
+                    d[col] = None
+                elif t == "integer":
+                    d[col] = int(v)
+                elif t == "float":
+                    d[col] = float(v)
+                else:
+                    d[col] = v
+            else:
+                d[col] = val
+        rows.append(d)
+    return rows, result_inner.get("last_insert_rowid"), result_inner.get("affected_row_count", 0)
+
+def turso_executescript(sql_script):
+    """Execute multiple SQL statements on Turso."""
+    statements = [s.strip() for s in sql_script.strip().split(";") if s.strip()]
+    requests = []
+    for stmt in statements:
+        requests.append({"type": "execute", "stmt": {"sql": stmt}})
+    requests.append({"type": "close"})
+
+    http_url = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+    body = _json.dumps({"requests": requests})
+    req = _urllib.Request(
+        http_url,
+        data=body.encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {TURSO_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with _urllib.urlopen(req) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+# ── TursoConn: sqlite3-compatible wrapper ──────────────────────────────────────
+class TursoConn:
+    """Mimics sqlite3 connection interface using Turso HTTP API."""
+    def __init__(self):
+        self._last_rowid = None
+
+    def execute(self, sql, params=None):
+        rows, rowid, affected = turso_execute(sql, params)
+        self._last_rowid = rowid
+        return TursoCursor(rows, rowid)
+
+    def executescript(self, sql):
+        turso_executescript(sql)
+
+    def commit(self):
+        pass  # Turso auto-commits
+
+    def close(self):
+        pass
+
+    def cursor(self):
+        return TursoCursorWriter(self)
+
+class TursoCursorWriter:
+    """Cursor that supports lastrowid after INSERT."""
+    def __init__(self, conn):
+        self._conn = conn
+        self.lastrowid = None
+
+    def execute(self, sql, params=None):
+        rows, rowid, affected = turso_execute(sql, params)
+        self.lastrowid = int(rowid) if rowid else None
+        return TursoCursor(rows, rowid)
+
+    def executescript(self, sql):
+        turso_executescript(sql)
+
+class TursoCursor:
+    """Mimics sqlite3.Cursor for SELECT results."""
+    def __init__(self, rows, rowid=None):
+        self._rows = rows
+        self.lastrowid = int(rowid) if rowid else None
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        if self._rows:
+            r = self._rows[0]
+            # Support both dict access and ["key"] access
+            return DictRow(r)
+        return None
+
+    def __iter__(self):
+        return iter([DictRow(r) for r in self._rows])
+
+class DictRow(dict):
+    """Dict that also supports attribute access like sqlite3.Row."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
 # ── Database ───────────────────────────────────────────────────────────────────
 def get_db():
     if USE_TURSO:
-        conn = libsql.connect(
-            database=TURSO_URL,
-            auth_token=TURSO_TOKEN
-        )
-        conn.row_factory = libsql.Row
+        return TursoConn()
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-    return conn
+        return conn
 
 def init_db():
     conn = get_db()
     c = conn.cursor()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
+    # Create tables one by one (Turso handles each separately)
+    tables = [
+        """CREATE TABLE IF NOT EXISTS users (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             username  TEXT    UNIQUE NOT NULL,
             password  TEXT    NOT NULL,
             role      TEXT    DEFAULT 'user',
             created   TEXT    DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS scan_logs (
+        )""",
+        """CREATE TABLE IF NOT EXISTS scan_logs (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             filename        TEXT NOT NULL,
             file_size       INTEGER,
@@ -117,8 +276,8 @@ def init_db():
             is_quarantined  INTEGER DEFAULT 0,
             scanned_by      TEXT,
             attack_type     TEXT DEFAULT NULL
-        );
-        CREATE TABLE IF NOT EXISTS quarantine_records (
+        )""",
+        """CREATE TABLE IF NOT EXISTS quarantine_records (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             scan_log_id     INTEGER,
             original_path   TEXT,
@@ -126,14 +285,25 @@ def init_db():
             quarantined_at  TEXT DEFAULT (datetime('now')),
             status          TEXT DEFAULT 'quarantined',
             FOREIGN KEY(scan_log_id) REFERENCES scan_logs(id)
-        );
-    """)
-    c.execute(
-        "INSERT OR IGNORE INTO users (username, password, role) VALUES (?,?,?)",
-        ("admin", hashlib.sha256("admin123".encode()).hexdigest(), "admin")
-    )
+        )"""
+    ]
+    for table_sql in tables:
+        try:
+            c.execute(table_sql)
+        except Exception as e:
+            print(f"[init_db] table create note: {e}")
+
+    # Insert default admin
+    try:
+        c.execute(
+            "INSERT OR IGNORE INTO users (username, password, role) VALUES (?,?,?)",
+            ("admin", hashlib.sha256("admin123".encode()).hexdigest(), "admin")
+        )
+    except Exception as e:
+        print(f"[init_db] admin insert note: {e}")
     conn.commit()
     conn.close()
+    print("[DB] init_db() complete")
 
 init_db()
 
